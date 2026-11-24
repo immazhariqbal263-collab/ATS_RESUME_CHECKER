@@ -44,9 +44,15 @@ README.md
 |---|---|---|
 | `GEMINI_API_KEY` | secrets / env var / sidebar | none (required) |
 | `GEMINI_MODEL` | secrets / env var / sidebar | `gemini-3.5-flash` |
+| `GEMINI_FALLBACK_MODELS` | secrets / env var / sidebar | `gemini-2.5-flash,gemini-2.5-flash-lite` |
 
 If you get a "model not found" error, check the current Flash model names in
 [Google AI Studio](https://aistudio.google.com) and enter one in the sidebar.
+
+## Handling "503 UNAVAILABLE / high demand" errors
+These come from Google's servers being busy and are temporary. The app retries each model up to
+3 times (waiting 2s, then 4s) and then switches to the backup models. If every model is busy it
+shows a friendly message; just wait a minute and click **Analyze** again.
 
 ## Deploy on Streamlit Community Cloud
 1. Push this repo to GitHub.

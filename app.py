@@ -15,9 +15,9 @@ import streamlit as st
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.5-flash"  # change in the sidebar or via GEMINI_MODEL
-# Tried in order if the main model is overloaded (override with GEMINI_FALLBACK_MODELS, comma-separated)
-DEFAULT_FALLBACK_MODELS = "gemini-2.5-flash,gemini-2.5-flash-lite"
+DEFAULT_MODEL = ""  # blank = auto-detect a Flash model your key can use (or set GEMINI_MODEL)
+# Optional extra models to try first (GEMINI_FALLBACK_MODELS, comma-separated). Usually leave blank.
+DEFAULT_FALLBACK_MODELS = ""
 RETRIES_PER_MODEL = 3
 RETRY_DELAY_SECONDS = 2  # doubles after each failed attempt
 MAX_RESUME_CHARS = 30000
@@ -213,6 +213,33 @@ def _should_try_next_model(exc: Exception) -> bool:
     return _is_transient(exc) or any(m in low for m in ("429", "quota", "resource_exhausted", "404", "not found"))
 
 
+_EXCLUDED_MODEL_WORDS = ("image", "tts", "audio", "live", "embed", "robotics", "computer-use", "learnlm", "gemma")
+
+
+def _model_rank(name: str):
+    """Sort key: stable before preview, full before lite, newer version first."""
+    low = name.lower()
+    match = re.search(r"gemini-(\d+(?:\.\d+)?)", low)
+    version = float(match.group(1)) if match else 0.0
+    unstable = "preview" in low or "exp" in low
+    return (unstable, "lite" in low, -version, low)
+
+
+def list_flash_models(client, limit: int = 3) -> list:
+    """Ask the Gemini API which Flash text models this key can actually use."""
+    names = set()
+    for m in client.models.list():
+        name = (getattr(m, "name", "") or "").split("/", 1)[-1]
+        low = name.lower()
+        if "flash" not in low or any(w in low for w in _EXCLUDED_MODEL_WORDS):
+            continue
+        actions = getattr(m, "supported_actions", None)
+        if actions and "generateContent" not in actions:
+            continue
+        names.add(name)
+    return sorted(names, key=_model_rank)[:limit]
+
+
 def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str, fallback_models=()) -> dict:
     from google import genai
     from google.genai import types
@@ -224,27 +251,50 @@ def analyze_resume(api_key: str, model: str, resume_text: str, job_description: 
         response_mime_type="application/json",
     )
     prompt = build_prompt(resume_text, job_description)
+    tried = []
+    state = {"last": None}
 
-    models = [model] + [m for m in fallback_models if m and m != model]
-    last_exc = None
-    for name in models:
-        delay = RETRY_DELAY_SECONDS
-        for attempt in range(RETRIES_PER_MODEL):
-            try:
-                response = client.models.generate_content(model=name, contents=prompt, config=config)
-                result = normalize_result(parse_json_response(response.text))
-                result["model_used"] = name
-                return result
-            except Exception as exc:
-                last_exc = exc
-                if not _should_try_next_model(exc):
-                    raise  # e.g. invalid API key: retrying won't help
-                if _is_transient(exc) and attempt < RETRIES_PER_MODEL - 1:
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-                break  # give up on this model, try the next one
-    raise last_exc
+    def attempt(names):
+        for name in names:
+            if not name or name in tried:
+                continue
+            tried.append(name)
+            delay = RETRY_DELAY_SECONDS
+            for i in range(RETRIES_PER_MODEL):
+                try:
+                    response = client.models.generate_content(model=name, contents=prompt, config=config)
+                    result = normalize_result(parse_json_response(response.text))
+                    result["model_used"] = name
+                    return result
+                except Exception as exc:
+                    state["last"] = exc
+                    if not _should_try_next_model(exc):
+                        raise  # e.g. invalid API key: retrying won't help
+                    if _is_transient(exc) and i < RETRIES_PER_MODEL - 1:
+                        time.sleep(delay)
+                        delay *= 2
+                        continue
+                    break  # give up on this model, try the next one
+        return None
+
+    # 1) the model(s) the user asked for, if any
+    result = attempt(([model] if model else []) + list(fallback_models))
+    if result:
+        return result
+
+    # 2) auto-detect Flash models that this API key can really use
+    try:
+        discovered = list_flash_models(client)
+    except Exception as exc:
+        state["last"] = exc
+        discovered = []
+    result = attempt(discovered)
+    if result:
+        return result
+
+    if state["last"] is None:
+        raise ValueError("No Gemini Flash model is available for this API key.")
+    raise state["last"]
 
 
 def friendly_error(exc: Exception) -> str:
@@ -260,7 +310,8 @@ def friendly_error(exc: Exception) -> str:
     if "429" in low or "quota" in low or "rate" in low or "resource_exhausted" in low:
         return "Gemini rate limit or quota reached. Please wait a minute and try again."
     if "404" in low or "not found" in low:
-        return "The selected model name was not found. Change the model name in the sidebar."
+        return ("No usable Gemini model was found for your key. Clear the model box in the sidebar "
+                "so the app can auto-select one, or check your key at aistudio.google.com.")
     return f"Something went wrong: {msg}"
 
 
@@ -378,9 +429,13 @@ def main() -> None:
             api_key = st.text_input("Gemini API key", type="password", help="Get a free key at aistudio.google.com")
         else:
             st.success("API key loaded from secrets.")
-        model = st.text_input("Gemini model", value=get_setting("GEMINI_MODEL") or DEFAULT_MODEL)
+        model = st.text_input(
+            "Gemini model (blank = auto)",
+            value=get_setting("GEMINI_MODEL") or DEFAULT_MODEL,
+            help="Leave blank and the app picks an available Flash model automatically.",
+        )
         fallback_raw = st.text_input(
-            "Backup models (comma-separated)",
+            "Extra backup models (optional)",
             value=get_setting("GEMINI_FALLBACK_MODELS") or DEFAULT_FALLBACK_MODELS,
             help="Used automatically if the main model is overloaded or unavailable.",
         )
@@ -408,7 +463,7 @@ def main() -> None:
                 return
             with st.spinner("Analyzing with Gemini..."):
                 fallbacks = [m.strip() for m in fallback_raw.split(",") if m.strip()]
-                result = analyze_resume(api_key, model.strip() or DEFAULT_MODEL, text, job_description, fallbacks)
+                result = analyze_resume(api_key, model.strip(), text, job_description, fallbacks)
         except Exception as exc:  # show a friendly message instead of a traceback
             st.error(friendly_error(exc))
             return

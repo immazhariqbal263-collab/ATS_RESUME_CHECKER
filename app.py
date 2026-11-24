@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 
@@ -15,6 +16,10 @@ import streamlit as st
 # Configuration
 # --------------------------------------------------------------------------
 DEFAULT_MODEL = "gemini-3.5-flash"  # change in the sidebar or via GEMINI_MODEL
+# Tried in order if the main model is overloaded (override with GEMINI_FALLBACK_MODELS, comma-separated)
+DEFAULT_FALLBACK_MODELS = "gemini-2.5-flash,gemini-2.5-flash-lite"
+RETRIES_PER_MODEL = 3
+RETRY_DELAY_SECONDS = 2  # doubles after each failed attempt
 MAX_RESUME_CHARS = 30000
 MIN_RESUME_CHARS = 150
 
@@ -193,26 +198,63 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+def _is_transient(exc: Exception) -> bool:
+    """True for temporary Gemini problems worth retrying (overload, timeouts)."""
+    low = str(exc).lower()
+    return any(
+        marker in low
+        for marker in ("503", "unavailable", "high demand", "overloaded", "500", "504", "deadline", "timed out")
+    )
+
+
+def _should_try_next_model(exc: Exception) -> bool:
+    """True when switching to another model may help (overload, quota, unknown model)."""
+    low = str(exc).lower()
+    return _is_transient(exc) or any(m in low for m in ("429", "quota", "resource_exhausted", "404", "not found"))
+
+
+def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str, fallback_models=()) -> dict:
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.2,
+        response_mime_type="application/json",
     )
-    return normalize_result(parse_json_response(response.text))
+    prompt = build_prompt(resume_text, job_description)
+
+    models = [model] + [m for m in fallback_models if m and m != model]
+    last_exc = None
+    for name in models:
+        delay = RETRY_DELAY_SECONDS
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=name, contents=prompt, config=config)
+                result = normalize_result(parse_json_response(response.text))
+                result["model_used"] = name
+                return result
+            except Exception as exc:
+                last_exc = exc
+                if not _should_try_next_model(exc):
+                    raise  # e.g. invalid API key: retrying won't help
+                if _is_transient(exc) and attempt < RETRIES_PER_MODEL - 1:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                break  # give up on this model, try the next one
+    raise last_exc
 
 
 def friendly_error(exc: Exception) -> str:
     msg = str(exc)
     low = msg.lower()
+    if "503" in low or "unavailable" in low or "high demand" in low or "overloaded" in low:
+        return (
+            "Gemini is overloaded right now (temporary). The app already retried and tried backup "
+            "models - please wait a minute and click Analyze again."
+        )
     if "api key" in low or "api_key" in low or "permission" in low or "401" in low or "403" in low:
         return "The Gemini API key was rejected. Please check that it is correct and active."
     if "429" in low or "quota" in low or "rate" in low or "resource_exhausted" in low:
@@ -268,6 +310,8 @@ def score_label(score: int) -> str:
 
 def render_results(result: dict, filename: str) -> None:
     score = result["overall_score"]
+    if result.get("model_used"):
+        st.caption(f"Analyzed with {result['model_used']}")
     left, right = st.columns([1, 3])
     with left:
         st.metric("ATS Score", f"{score}/100", score_label(score), delta_color="off")
@@ -335,6 +379,11 @@ def main() -> None:
         else:
             st.success("API key loaded from secrets.")
         model = st.text_input("Gemini model", value=get_setting("GEMINI_MODEL") or DEFAULT_MODEL)
+        fallback_raw = st.text_input(
+            "Backup models (comma-separated)",
+            value=get_setting("GEMINI_FALLBACK_MODELS") or DEFAULT_FALLBACK_MODELS,
+            help="Used automatically if the main model is overloaded or unavailable.",
+        )
         st.caption("The score is an AI-generated estimate, not the output of a real ATS.")
 
     uploaded = st.file_uploader("Upload your resume", type=["pdf", "docx", "txt"])
@@ -358,7 +407,8 @@ def main() -> None:
                 )
                 return
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_resume(api_key, model.strip() or DEFAULT_MODEL, text, job_description)
+                fallbacks = [m.strip() for m in fallback_raw.split(",") if m.strip()]
+                result = analyze_resume(api_key, model.strip() or DEFAULT_MODEL, text, job_description, fallbacks)
         except Exception as exc:  # show a friendly message instead of a traceback
             st.error(friendly_error(exc))
             return
